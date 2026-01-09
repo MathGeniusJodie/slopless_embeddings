@@ -1,49 +1,64 @@
 use anyhow::Result;
-use ndarray::{Array2, ArrayView3};
-use ort::{inputs, session::builder::GraphOptimizationLevel, session::builder::SessionBuilder, session::Session};
-use std::collections::HashMap;
+use ndarray::Array2;
+use ort::{
+    inputs, session::Session, session::builder::GraphOptimizationLevel,
+    session::builder::SessionBuilder,
+};
 use tokenizers::Tokenizer;
 
-// --- 1. Struct to hold the "Setup" state ---
 pub struct NeuralSparseModel {
     session: Session,
     tokenizer: Tokenizer,
+    // Pre-allocated buffer to avoid allocation every request
+    vocab_buffer: Vec<f32>,
 }
 
 impl NeuralSparseModel {
-    // --- Setup Logic: Loads Model and Tokenizer ---
     pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self> {
-        println!("Loading model from {}...", model_path);
-
         // Initialize ONNX Runtime Session
         let session = SessionBuilder::new()?
             .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(4)?
+            .with_intra_threads(20)? // Adjust based on CPU cores
             .commit_from_file(model_path)?;
 
-        // Load Tokenizer
+        for output in session.outputs() {
+            println!("Output Name: {}", output.name());
+            println!("Output Type: {:?}", output.dtype());
+        }
+
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e))?;
 
-        Ok(Self { session, tokenizer })
+        // Get vocab size directly from tokenizer to size our buffer
+        let vocab_size = tokenizer.get_vocab_size(true);
+
+        Ok(Self {
+            session,
+            tokenizer,
+            vocab_buffer: vec![0.0; vocab_size],
+        })
     }
 
-    // --- Sentence to Tokens Logic: Runs inference and calculates weights ---
     pub fn generate_sparse_vector(&mut self, text: &str) -> Result<Vec<(String, f32)>> {
-        // 1. Tokenization
-        let encoding = self.tokenizer.encode(text, true).map_err(|e| anyhow::anyhow!(e))?;
-        
+        // --- 1. Tokenization ---
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!(e))?;
         let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-        let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
-        
+        let attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&x| x as i64)
+            .collect();
+
         let batch_size = 1;
         let seq_len = input_ids.len();
 
-        // Create ndarray tensors (Batch, Seq)
         let input_ids_array = Array2::from_shape_vec((batch_size, seq_len), input_ids)?;
-        let attention_mask_array = Array2::from_shape_vec((batch_size, seq_len), attention_mask.clone())?;
+        let attention_mask_array = Array2::from_shape_vec((batch_size, seq_len), attention_mask)?;
         let token_type_ids_array = Array2::<i64>::zeros((batch_size, seq_len));
 
-        // 2. Run Inference
+        // --- 2. Inference ---
         let inputs = inputs![
             "input_ids" => ort::value::Value::from_array(input_ids_array)?,
             "attention_mask" => ort::value::Value::from_array(attention_mask_array.clone())?,
@@ -51,94 +66,113 @@ impl NeuralSparseModel {
         ];
 
         let outputs = self.session.run(inputs)?;
-        
-        // Extract output (logits)
         let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-        let (output_shape, output_data) = output_tensor; // [Batch, Seq, Vocab_Size]
-        let vocab_size = output_shape[2] as usize;
+        let (dims, output_data) = output_tensor;
+        // Dims: [Batch, Seq, Vocab]
+        let vocab_size = dims[2] as usize;
 
-        let output_array = ArrayView3::<f32>::from_shape(
-            (output_shape[0] as usize, output_shape[1] as usize, output_shape[2] as usize),
-            output_data
-        )?;
+        // Ensure buffer is clean and sized correctly
+        if self.vocab_buffer.len() != vocab_size {
+            self.vocab_buffer.resize(vocab_size, f32::NEG_INFINITY);
+        } else {
+            self.vocab_buffer.fill(f32::NEG_INFINITY);
+        }
 
-        // 3. SPLADE / Neural Sparse Logic
-        // Logic: Weight = max(log(1 + relu(activation))) over the sequence dimension
-        let batch_idx = 0;
-        let mut sparse_vector: HashMap<usize, f32> = HashMap::new();
+        // --- 3. Optimized Max-Pooling (The "Dense" Approach) ---
+        // We iterate linearly through the data.
+        // Data layout is [Seq 0 [Vocab...], Seq 1 [Vocab...]]
 
-        // Iterate over Sequence dimension
+        let mut max_activation = 0.0f32;
+
+        // Iterate over sequence steps
         for seq_idx in 0..seq_len {
-            // Skip padding tokens
-            if attention_mask_array[[batch_idx, seq_idx]] == 0 {
+            // Skip logic for padding tokens (based on attention mask)
+            if attention_mask_array[[0, seq_idx]] == 0 {
                 continue;
             }
 
-            for vocab_idx in 0..vocab_size {
-                let logit = output_array[[batch_idx, seq_idx, vocab_idx]];
-                
-                // ReLU
-                let relu_out = if logit > 0.0 { logit } else { 0.0 };
-                
-                if relu_out > 0.0 {
-                    // log(1 + x)
-                    let weight = (1.0f32 + relu_out).ln();
+            // Get the slice of logits for this specific token in the sequence
+            let offset = seq_idx * vocab_size;
+            let logits_slice = &output_data[offset..offset + vocab_size];
 
-                    // Max Pooling
-                    let entry = sparse_vector.entry(vocab_idx).or_insert(0.0);
-                    if weight > *entry {
-                        *entry = weight;
-                    }
+            // Hot loop: pure array indexing, extremely fast cache access
+            for (vocab_idx, &logit) in logits_slice.iter().enumerate() {
+                if logit > self.vocab_buffer[vocab_idx] {
+                    self.vocab_buffer[vocab_idx] = logit;
                 }
             }
         }
 
-        // 4. Pruning
-        if sparse_vector.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let max_weight = sparse_vector.values().fold(0.0f32, |a, &b| a.max(b));
-        let threshold = max_weight * 0.1;
-
-        // Decode and filter
+        // --- 4. Activation, Thresholding & Decoding ---
         let mut result_vector: Vec<(String, f32)> = Vec::new();
 
-        for (vocab_id, weight) in sparse_vector {
+        // Compute actual weights and find global max for thresholding
+        // We do this in one pass over the vocab
+        for val in self.vocab_buffer.iter_mut() {
+            // Apply ReLU: if *val < 0, make it 0
+            if *val < 0.0 {
+                *val = 0.0;
+            }
+
+            // Apply Log saturation: log(1 + val)
+            if *val > 0.0 {
+                *val = (1.0 + *val).ln();
+                if *val > max_activation {
+                    max_activation = *val;
+                }
+            }
+        }
+
+        let threshold = max_activation * 0.25; // Filter noise
+
+        for (vocab_id, &weight) in self.vocab_buffer.iter().enumerate() {
             if weight >= threshold {
-                let token = self.tokenizer.decode(&[vocab_id as u32], false).unwrap_or_else(|_| "???".to_string());
+                // Only decode significant tokens
+                let token = self
+                    .tokenizer
+                    .decode(&[vocab_id as u32], false)
+                    .unwrap_or_default();
                 result_vector.push((token, weight));
             }
         }
 
-        // Sort by weight descending
+        // Sort by score
         result_vector.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        Ok(result_vector)
+        // --- 5. Clean Subwords (Optional Polish) ---
+        // If result has "run" and "##ning", this is where you'd handle it.
+        // For SPLADE (Bag of Words), strict merging is hard because order is lost,
+        // but we can clean the "##" visuals.
+        let cleaned_vector: Vec<(String, f32)> = result_vector
+            .into_iter()
+            .map(|(tok, w)| (tok.replace("##", ""), w))
+            .collect();
+
+        Ok(cleaned_vector)
     }
 }
 
-// --- Main execution ---
 fn main() -> Result<()> {
-    // Paths
     let model_path = "/home/jodie/opensearch_rs/onnx_output/model_quantized.onnx";
     let tokenizer_path = "/home/jodie/opensearch_rs/onnx_output/tokenizer.json";
 
-    // 1. Initialization Phase
     let mut splade_model = NeuralSparseModel::new(model_path, tokenizer_path)?;
+    // Warmup (optional)
+    let _ = splade_model.generate_sparse_vector("warmup");
 
-    // 2. Input
-    let text = "Rust is a systems programming language that runs blazingly fast.";
-    println!("Input: \"{}\"", text);
+    let start = std::time::Instant::now();
+    let sparse_features = splade_model.generate_sparse_vector("Rust is a systems programming language that runs blazingly fast.")?;
+    let duration = start.elapsed();
 
-    // 3. Inference Phase
-    let sparse_features = splade_model.generate_sparse_vector(text)?;
-
-    // 4. Display Results
+    println!("Inference took: {:?}", duration);
     println!("\nTop Sparse Features:");
-    for (token, weight) in sparse_features.iter() {
+    for (token, weight) in sparse_features.iter(){
         println!("  {:<15} : {:.4}", token, weight);
     }
+
+    println!("{:?}",splade_model.generate_sparse_vector(
+        "To be or not to be, that is the question."
+    )?.iter().collect::<Vec<_>>());
 
     Ok(())
 }
