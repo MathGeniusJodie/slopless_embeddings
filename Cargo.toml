@@ -1,0 +1,12 @@
+[package]
+name = "opensearch_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Turn on 'load-dynamic' to download the ONNX Runtime library automatically
+ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
+ndarray = "0.17.1"
+tokenizers = "0.22.2"
+anyhow = "1.0"
+tokenizer = "0.1.2"
