@@ -54,7 +54,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ctx_params = LlamaContextParams::default()
         .with_n_threads_batch(std::thread::available_parallelism()?.get().try_into()?)
         .with_embeddings(true)
-        .with_n_seq_max(16);
+        .with_n_seq_max(16)
+        .with_n_threads(std::thread::available_parallelism()?.get().try_into()?);
 
     let mut ctx = model
         .new_context(&backend, ctx_params)
@@ -62,10 +63,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Split the prompt to display the batching functionality
     let prompt = "The quick brown fox jumps over the lazy dog.\n\
+                  I am Jodie.\n\
+                  I am a stegosaurus.\n\
+                  I am dad.\n\
+                  Lorem ipsum\n\
+                  My father was a carpenter\n\
                   I am Groot.\n\
                   To be, or not to be, that is the question.\n\
                   When in the course of human events, it becomes necessary for one people to dissolve the political bands which have connected them with another.\n\
-                  All that glitters is not gold.\n";
+                  All that glitters is not gold.";
     let prompt_lines = prompt.lines();
 
     let time = std::time::Instant::now();
