@@ -1,178 +1,152 @@
+use anyhow::Context;
 use anyhow::Result;
-use ndarray::Array2;
-use ort::{
-    inputs, session::Session, session::builder::GraphOptimizationLevel,
-    session::builder::SessionBuilder,
-};
-use tokenizers::Tokenizer;
+use llama_cpp_2::context::LlamaContext;
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
+use llama_cpp_2::model::LlamaModel;
+use llama_cpp_2::model::{AddBos, Special};
+use tokio::time;
+use std::error::Error;
+use std::io::Write;
 
-pub struct NeuralSparseModel {
-    session: Session,
-    tokenizer: Tokenizer,
-    // Pre-allocated buffer to avoid allocation every request
-    vocab_buffer: Vec<f32>,
+fn normalize(input: &[f32]) -> Vec<f32> {
+    let magnitude = input
+        .iter()
+        .fold(0.0, |acc, &val| val.mul_add(val, acc))
+        .sqrt();
+
+    input.iter().map(|&val| val / magnitude).collect()
 }
 
-impl NeuralSparseModel {
-    pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self> {
-        // Initialize ONNX Runtime Session
-        let session = SessionBuilder::new()?
-            .with_optimization_level(GraphOptimizationLevel::Level3)?
-            .with_intra_threads(20)? // Adjust based on CPU cores
-            .commit_from_file(model_path)?;
+fn batch_decode(
+    ctx: &mut LlamaContext,
+    batch: &mut LlamaBatch,
+    s_batch: i32,
+    output: &mut Vec<Vec<f32>>,
+    normalise: bool,
+) -> Result<()> {
+    ctx.clear_kv_cache();
+    ctx.decode(batch).with_context(|| "llama_decode() failed")?;
 
-        for output in session.outputs() {
-            println!("Output Name: {}", output.name());
-            println!("Output Type: {:?}", output.dtype());
-        }
-
-        let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e))?;
-
-        // Get vocab size directly from tokenizer to size our buffer
-        let vocab_size = tokenizer.get_vocab_size(true);
-
-        Ok(Self {
-            session,
-            tokenizer,
-            vocab_buffer: vec![0.0; vocab_size],
-        })
-    }
-
-    pub fn generate_sparse_vector(&mut self, text: &str) -> Result<Vec<(String, f32)>> {
-        // --- 1. Tokenization ---
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-        let attention_mask: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&x| x as i64)
-            .collect();
-
-        let batch_size = 1;
-        let seq_len = input_ids.len();
-
-        let input_ids_array = Array2::from_shape_vec((batch_size, seq_len), input_ids)?;
-        let attention_mask_array = Array2::from_shape_vec((batch_size, seq_len), attention_mask)?;
-        let token_type_ids_array = Array2::<i64>::zeros((batch_size, seq_len));
-
-        // --- 2. Inference ---
-        let inputs = inputs![
-            "input_ids" => ort::value::Value::from_array(input_ids_array)?,
-            "attention_mask" => ort::value::Value::from_array(attention_mask_array.clone())?,
-            "token_type_ids" => ort::value::Value::from_array(token_type_ids_array)?
-        ];
-
-        let outputs = self.session.run(inputs)?;
-        let output_tensor = outputs[0].try_extract_tensor::<f32>()?;
-        let (dims, output_data) = output_tensor;
-        // Dims: [Batch, Seq, Vocab]
-        let vocab_size = dims[2] as usize;
-
-        // Ensure buffer is clean and sized correctly
-        if self.vocab_buffer.len() != vocab_size {
-            self.vocab_buffer.resize(vocab_size, f32::NEG_INFINITY);
+    for i in 0..s_batch {
+        let embedding = ctx
+            .embeddings_seq_ith(i)
+            .with_context(|| "Failed to get embeddings")?;
+        let output_embeddings = if normalise {
+            normalize(embedding)
         } else {
-            self.vocab_buffer.fill(f32::NEG_INFINITY);
-        }
+            embedding.to_vec()
+        };
 
-        // --- 3. Optimized Max-Pooling (The "Dense" Approach) ---
-        // We iterate linearly through the data.
-        // Data layout is [Seq 0 [Vocab...], Seq 1 [Vocab...]]
-
-        let mut max_activation = 0.0f32;
-
-        // Iterate over sequence steps
-        for seq_idx in 0..seq_len {
-            // Skip logic for padding tokens (based on attention mask)
-            if attention_mask_array[[0, seq_idx]] == 0 {
-                continue;
-            }
-
-            // Get the slice of logits for this specific token in the sequence
-            let offset = seq_idx * vocab_size;
-            let logits_slice = &output_data[offset..offset + vocab_size];
-
-            // Hot loop: pure array indexing, extremely fast cache access
-            for (vocab_idx, &logit) in logits_slice.iter().enumerate() {
-                if logit > self.vocab_buffer[vocab_idx] {
-                    self.vocab_buffer[vocab_idx] = logit;
-                }
-            }
-        }
-
-        // --- 4. Activation, Thresholding & Decoding ---
-        let mut result_vector: Vec<(String, f32)> = Vec::new();
-
-        // Compute actual weights and find global max for thresholding
-        // We do this in one pass over the vocab
-        for val in self.vocab_buffer.iter_mut() {
-            // Apply ReLU: if *val < 0, make it 0
-            if *val < 0.0 {
-                *val = 0.0;
-            }
-
-            // Apply Log saturation: log(1 + val)
-            if *val > 0.0 {
-                *val = (1.0 + *val).ln();
-                if *val > max_activation {
-                    max_activation = *val;
-                }
-            }
-        }
-
-        let threshold = max_activation * 0.25; // Filter noise
-
-        for (vocab_id, &weight) in self.vocab_buffer.iter().enumerate() {
-            if weight >= threshold {
-                // Only decode significant tokens
-                let token = self
-                    .tokenizer
-                    .decode(&[vocab_id as u32], false)
-                    .unwrap_or_default();
-                result_vector.push((token, weight));
-            }
-        }
-
-        // Sort by score
-        result_vector.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-        // --- 5. Clean Subwords (Optional Polish) ---
-        // If result has "run" and "##ning", this is where you'd handle it.
-        // For SPLADE (Bag of Words), strict merging is hard because order is lost,
-        // but we can clean the "##" visuals.
-        let cleaned_vector: Vec<(String, f32)> = result_vector
-            .into_iter()
-            .map(|(tok, w)| (tok.replace("##", ""), w))
-            .collect();
-
-        Ok(cleaned_vector)
+        output.push(output_embeddings);
     }
+
+    batch.clear();
+
+    Ok(())
 }
+fn main() -> Result<(), Box<dyn Error>> {
+    let backend = LlamaBackend::init()?;
+    let model_params = LlamaModelParams::default();
+    let model = LlamaModel::load_from_file(&backend, "/home/jodie/opensearch_rs/nomic-embed-text-v2-moe.Q4_K_M.gguf", &model_params)?;
+    let ctx_params = LlamaContextParams::default()
+        .with_n_threads_batch(std::thread::available_parallelism()?.get().try_into()?)
+        .with_embeddings(true)
+        .with_n_seq_max(16);
 
-fn main() -> Result<()> {
-    let model_path = "/home/jodie/opensearch_rs/onnx_output/model_quantized.onnx";
-    let tokenizer_path = "/home/jodie/opensearch_rs/onnx_output/tokenizer.json";
+    let mut ctx = model
+        .new_context(&backend, ctx_params)
+        .with_context(|| "unable to create the llama_context")?;
 
-    let mut splade_model = NeuralSparseModel::new(model_path, tokenizer_path)?;
-    // Warmup (optional)
-    let _ = splade_model.generate_sparse_vector("warmup");
+    // Split the prompt to display the batching functionality
+    let prompt = "The quick brown fox jumps over the lazy dog.\n\
+                  I am Groot.\n\
+                  To be, or not to be, that is the question.\n\
+                  When in the course of human events, it becomes necessary for one people to dissolve the political bands which have connected them with another.\n\
+                  All that glitters is not gold.\n";
+    let prompt_lines = prompt.lines();
 
-    let start = std::time::Instant::now();
-    let sparse_features = splade_model.generate_sparse_vector("Rust is a systems programming language that runs blazingly fast.")?;
-    let duration = start.elapsed();
+    let time = std::time::Instant::now();
+    // tokenize the prompt
+    let tokens_lines_list = prompt_lines
+        .map(|line| model.str_to_token(line, AddBos::Always))
+        .collect::<Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to tokenize {prompt}"))?;
+    eprintln!("Tokenization took {:?}", time.elapsed());
 
-    println!("Inference took: {:?}", duration);
-    println!("\nTop Sparse Features:");
-    for (token, weight) in sparse_features.iter(){
-        println!("  {:<15} : {:.4}", token, weight);
+    let n_ctx = ctx.n_ctx() as usize;
+    let n_ctx_train = model.n_ctx_train();
+
+    eprintln!("n_ctx = {n_ctx}, n_ctx_train = {n_ctx_train}");
+
+    if tokens_lines_list.iter().any(|tok| n_ctx < tok.len()) {
+        println!(
+            "Warning: prompt length exceeds model context size ({} > {})",
+            tokens_lines_list.iter().map(|tok| tok.len()).max().unwrap_or(0),
+            n_ctx
+        );
+        return Ok(());
     }
 
-    println!("{:?}",splade_model.generate_sparse_vector(
-        "To be or not to be, that is the question."
-    )?.iter().collect::<Vec<_>>());
+    // print the prompt token-by-token
+    eprintln!();
 
+    for (i, token_line) in tokens_lines_list.iter().enumerate() {
+        eprintln!("Prompt {i}");
+        for token in token_line {
+            // Attempt to convert token to string and print it; if it fails, print the token instead
+            match model.token_to_str(*token, Special::Tokenize) {
+                Ok(token_str) => eprintln!("{token} --> {token_str}"),
+                Err(e) => {
+                    eprintln!("Failed to convert token to string, error: {e}");
+                    eprintln!("Token value: {token}");
+                }
+            }
+        }
+        eprintln!();
+    }
+
+    std::io::stderr().flush()?;
+    let mut output = Vec::with_capacity(tokens_lines_list.len());
+
+    let time = std::time::Instant::now();
+    for tokens in &tokens_lines_list {
+        // Create a fresh batch for each sequence
+        let mut batch = LlamaBatch::new(n_ctx, 1);
+        batch.add_sequence(tokens, 0, false)?;
+        batch_decode(
+            &mut ctx,
+            &mut batch,
+            1, // Only one sequence in this batch
+            &mut output,
+            true,
+        )?;
+    }
+    eprintln!("Embedding computation took {:?}", time.elapsed());
+
+    // try batch all together
+    
+    let time = std::time::Instant::now();
+    let mut output = Vec::with_capacity(tokens_lines_list.len());
+    let mut batch = LlamaBatch::new(n_ctx, tokens_lines_list.len() as i32);
+    for (i,tokens) in tokens_lines_list.iter().enumerate() {
+        batch.add_sequence(tokens, i as i32, false)?;
+    }
+    batch_decode(
+        &mut ctx,
+        &mut batch,
+        tokens_lines_list.len() as i32,
+        &mut output,
+        true,
+    )?;
+    eprintln!("Batch embedding computation took {:?}", time.elapsed());
+
+
+    for (i, embeddings) in output.iter().enumerate() {
+        eprintln!("Embeddings {i}: {:?}", &embeddings.iter().take(256).map(|f| (f*127.0).round() as i8).collect::<Vec<_>>());
+        eprintln!();
+    }
     Ok(())
 }

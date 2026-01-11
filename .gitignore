@@ -1,2 +1,3 @@
 /target
 /onnx_output
+nomic-embed-text-v2-moe.Q4_K_M.gguf
