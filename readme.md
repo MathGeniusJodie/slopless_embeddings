@@ -27,19 +27,19 @@ When a query comes in, we will translate it to english, embed it, and search the
 faster and smaller for the quality than multilingual models. this will also ensure cross-language search works.
 
 # supported languages wishlist
-- [] English
-- [] French
-- [] Chinese
-- [] Spanish
-- [] Arabic
-- [] Portuguese
-- [] Indonesian
-- [] Malay
-- [] Japanese
-- [] Russian
-- [] German
-- [] Italian
-- [] Persian
-- [] Polish
-- [] Hindi
-- [] Vietnamese
+- [ ] English
+- [ ] French
+- [ ] Chinese
+- [ ] Spanish
+- [ ] Arabic
+- [ ] Portuguese
+- [ ] Indonesian
+- [ ] Malay
+- [ ] Japanese
+- [ ] Russian
+- [ ] German
+- [ ] Italian
+- [ ] Persian
+- [ ] Polish
+- [ ] Hindi
+- [ ] Vietnamese
