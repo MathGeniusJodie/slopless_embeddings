@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::LlamaPoolingType;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
@@ -10,6 +11,7 @@ use llama_cpp_2::model::{AddBos, Special};
 use tokio::time;
 use std::error::Error;
 use std::io::Write;
+use std::num::NonZero;
 
 fn normalize(input: &[f32]) -> Vec<f32> {
     let magnitude = input
@@ -55,23 +57,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         .with_n_threads_batch(std::thread::available_parallelism()?.get().try_into()?)
         .with_embeddings(true)
         .with_n_seq_max(16)
-        .with_n_threads(std::thread::available_parallelism()?.get().try_into()?);
+        .with_n_threads(std::thread::available_parallelism()?.get().try_into()?)
+        .with_n_ctx(Some(NonZero::new(512*16).unwrap()));
+        //.with_pooling_type(LlamaPoolingType::Mean);
 
     let mut ctx = model
         .new_context(&backend, ctx_params)
         .with_context(|| "unable to create the llama_context")?;
 
     // Split the prompt to display the batching functionality
-    let prompt = "The quick brown fox jumps over the lazy dog.\n\
-                  I am Jodie.\n\
-                  I am a stegosaurus.\n\
-                  I am dad.\n\
-                  Lorem ipsum\n\
-                  My father was a carpenter\n\
-                  I am Groot.\n\
-                  To be, or not to be, that is the question.\n\
-                  When in the course of human events, it becomes necessary for one people to dissolve the political bands which have connected them with another.\n\
-                  All that glitters is not gold.";
+    let prompt = "search_document: The quick brown fox jumps over the lazy dog.\n\
+search_document: I am Jodie.\n\
+search_document: I am a stegosaurus.\n\
+search_document: I am dad.\n\
+search_document: Lorem ipsum\n\
+search_document: My father was a carpenter\n\
+search_document: I am Groot.\n\
+search_document: To be, or not to be, that is the question.\n\
+search_document: When in the course of human events, it becomes necessary for one people to dissolve the political bands which have connected them with another.\n\
+search_document: All that glitters is not gold.";
     let prompt_lines = prompt.lines();
 
     let time = std::time::Instant::now();
