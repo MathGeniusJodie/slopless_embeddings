@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Turn on 'load-dynamic' to download the ONNX Runtime library automatically
 ort = { version = "2.0.0-rc.11", features = ["ndarray"] }
-ndarray = "0.17.1"
+ndarray = "0.17.2"
 tokenizers = "0.22.2"
 anyhow = "1.0"
 tokenizer = "0.1.2"
@@ -14,4 +14,6 @@ embed_anything = "0.6.7"
 tokio = "1.49.0"
 candle-core = "0.9.1"
 num_cpus = "1.17.0"
-llama-cpp-2 = "0.1.131"
+#llama-cpp-2 = "0.1.131"
+# get from git until llama-cpp-2 is updated on crates.io
+llama-cpp-2 = { git = "https://github.com/MathGeniusJodie/llama-cpp-rs.git", branch = "main" }
