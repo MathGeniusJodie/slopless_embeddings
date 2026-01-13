@@ -1,6 +1,5 @@
 use anyhow::Context;
 use anyhow::Result;
-use candle_core::quantized;
 use embed_anything::embeddings;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
@@ -10,8 +9,6 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::{LlamaModelParams, LlamaSplitMode};
 use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::{AddBos, Special};
-use ort::session::output;
-use tokio::time;
 use std::error::Error;
 use std::io::Write;
 use std::num::NonZero;
@@ -173,7 +170,7 @@ Represent this sentence for searching relevant passages: Who is my dad?";
         if max == 0.0 {
             max = 1.0;
         }
-        const RCP_MAX_I4_F32: f32 = 1.0/7.0;
+        const RCP_MAX_I4_F32: f32 = 1.0/7.5; // 1.5 for 2 bit quantization is not terrible
         let norm = max*RCP_MAX_I4_F32;
         let quantised = emb[..256]
             .iter()
@@ -195,22 +192,28 @@ Represent this sentence for searching relevant passages: Who is my dad?";
         eprintln!();
     }
 
+
     for (i, embeddings) in output.iter().enumerate() {
         // calc distance to last embedding
-        let dist = cosine_distance_groundtruth(
-            (&embeddings.0[..], embeddings.1),
-            (&output.last().unwrap().0[..], output.last().unwrap().1),
-        );
+        let mut a_combined = embeddings.0.clone();
+        a_combined.extend_from_slice(embeddings.1.to_le_bytes().as_slice());
+        let mut b_combined = output.last().unwrap().0.clone();
+        b_combined.extend_from_slice(output.last().unwrap().1.to_le_bytes().as_slice());
+        let dist = cosine_distance_groundtruth(&a_combined[..], &b_combined[..]);
+        let text = prompt_lines.clone().nth(i).unwrap_or("");
         if dist<0.1 {
             continue;
         }
-        let text = prompt_lines.clone().nth(i).unwrap_or("");
         eprintln!("Distance of Embeddings {text} to last: {}", dist);
+        println!("Length of combined embedding: {}", a_combined.len());
     }
+
     Ok(())
 }
 
-fn cosine_distance_groundtruth((a_i4, norm_a):(&[u8],f32), (b_i4,norm_b):(&[u8],f32)) -> f32 {
+fn cosine_distance_groundtruth(a_i4: &[u8], b_i4: &[u8]) -> f32 {
+    let norm_a = f32::from_le_bytes(a_i4[128..132].try_into().unwrap());
+    let norm_b = f32::from_le_bytes(b_i4[128..132].try_into().unwrap());
     let dot_product = unsafe {
         dot_i4_256_nibbles_unrolled(
             a_i4.as_ptr(),

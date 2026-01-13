@@ -3713,11 +3713,9 @@ name = "opensearch_rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "candle-core",
  "embed_anything",
  "llama-cpp-2",
  "ndarray 0.17.2",
- "num_cpus",
  "ort",
  "tokenizer",
  "tokenizers 0.22.2",
