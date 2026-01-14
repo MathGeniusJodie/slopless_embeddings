@@ -306,29 +306,6 @@ Represent this sentence for searching relevant passages: Who is my dad?";
             (quantized_i4, norm)
         })
         .collect::<Vec<_>>();
-/*
-    for (i, (embeddings, _)) in output.iter().enumerate() {
-        eprintln!(
-            "Embeddings {i}: {:?} Length: {}",
-            &embeddings,
-            embeddings.len()
-        );
-        eprintln!();
-    }*/
-
-    for (i, embeddings) in output.iter().enumerate() {
-        // calc distance to last embedding
-        let mut a_combined = embeddings.0.clone();
-        a_combined.extend_from_slice(embeddings.1.to_le_bytes().as_slice());
-        let mut b_combined = output.last().unwrap().0.clone();
-        b_combined.extend_from_slice(output.last().unwrap().1.to_le_bytes().as_slice());
-        let dist = cosine_distance_groundtruth(&a_combined[..], &b_combined[..]);
-        let text = prompt_lines.clone().nth(i).unwrap_or("");
-        if dist < 0.1 {
-            continue;
-        }
-        eprintln!("Distance of Embeddings {i} {text} to last: {}", dist);
-    }
 
     Ok(())
 }
